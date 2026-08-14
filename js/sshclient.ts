@@ -183,11 +183,18 @@ export default class SSHClient {
           },
         );
       } else {
+        // FIX BUG: kode asli manggil `passwordOrKey.toString()` di sini -
+        // karena `passwordOrKey` itu OBJECT `{ privateKey, passphrase }`,
+        // `.toString()` object JS polos menghasilkan literal string
+        // "[object Object]", BUKAN representasi data aslinya. Private key
+        // yang user masukkan jadi hilang total sebelum sempat sampai ke
+        // native code. Diganti `JSON.stringify` - representasi yang bisa
+        // di-parse balik dengan benar di sisi Java.
         RTNSshClient?.connectToHostByKey(
           this.host,
           this.port,
           this.username,
-          passwordOrKey.toString(),
+          JSON.stringify(passwordOrKey),
           this._key,
           (error: string) => {
             callback(error);

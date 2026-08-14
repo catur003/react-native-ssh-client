@@ -14,6 +14,7 @@ import com.jcraft.jsch.Channel;
 import com.jcraft.jsch.ChannelExec;
 import com.jcraft.jsch.ChannelShell;
 import com.jcraft.jsch.JSchException;
+import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.InputStream;
@@ -55,27 +56,60 @@ public class SshClientModule extends NativeRTNSshClientSpec {
 
     @Override
     public void connectToHostByPassword(final String host, final double port, final String username, final String passwordOrKey, final String key, final Callback callback) {
-        connectToHost(host, (int) port, username, passwordOrKey, null, key, callback);
+        connectToHost(host, (int) port, username, passwordOrKey, null, null, key, callback);
     }
 
     @Override
     public void connectToHostByKey(final String host, final double port, final String username, final String passwordOrKey, final String key, final Callback callback) {
-        // For key-based authentication, we need to parse the passwordOrKey as a JSON string
-        // This is a simplified version - you may need to enhance this based on your needs
-        connectToHost(host, (int) port, username, null, null, key, callback);
+        // BUG FIX: versi sebelumnya SELALU manggil connectToHost dengan
+        // keyPairs = null di sini (komentar aslinya bahkan ngaku "simplified
+        // version, may need to enhance"), padahal connectToHost baca
+        // `keyPairs.getString("privateKey")` tanpa null-check - itu
+        // penyebab pasti crash "ReadableMap.getString on a null object
+        // reference" setiap kali connectWithKey dipanggil, apapun private
+        // key-nya. Sisi JS (sshclient.ts) sekarang ngirim `passwordOrKey`
+        // sebagai JSON string (`JSON.stringify({ privateKey, passphrase })`)
+        // - bukan lagi `.toString()` object yang cuma menghasilkan literal
+        // "[object Object]". Di sini di-parse balik pakai org.json biar
+        // privateKey/passphrase-nya beneran sampai ke JSch, bukan hilang.
+        String privateKey = null;
+        String passphrase = null;
+        try {
+            JSONObject json = new JSONObject(passwordOrKey);
+            if (json.has("privateKey") && !json.isNull("privateKey")) {
+                privateKey = json.getString("privateKey");
+            }
+            if (json.has("passphrase") && !json.isNull("passphrase")) {
+                passphrase = json.getString("passphrase");
+            }
+        } catch (Exception parseError) {
+            Log.e(LOGTAG, "Gagal parse payload private key (bukan JSON valid): " + parseError.getMessage());
+            callback.invoke("Payload private key tidak valid di sisi native: " + parseError.getMessage());
+            return;
+        }
+
+        if (privateKey == null || privateKey.isEmpty()) {
+            callback.invoke("Private key kosong setelah di-parse - cek isi field Private Key di form.");
+            return;
+        }
+
+        connectToHost(host, (int) port, username, null, privateKey, passphrase, key, callback);
     }
 
-    private void connectToHost(final String host, final Integer port, final String username, final String password, final ReadableMap keyPairs, final String key, final Callback callback) {
+    private void connectToHost(final String host, final Integer port, final String username, final String password, final String privateKey, final String passphrase, final String key, final Callback callback) {
         new Thread(new Runnable() {
             public void run() {
                 try {
                     JSch jsch = new JSch();
 
                     if (password == null) {
-                        byte[] privateKey = keyPairs.getString("privateKey").getBytes();
-                        byte[] publicKey = keyPairs.hasKey("publicKey") ? keyPairs.getString("publicKey").getBytes() : null;
-                        byte[] passphrase = keyPairs.hasKey("passphrase") ? keyPairs.getString("passphrase").getBytes() : null;
-                        jsch.addIdentity("default", privateKey, publicKey, passphrase);
+                        // BUG FIX: sebelumnya baca dari `keyPairs.getString(...)`
+                        // (ReadableMap yang SELALU null - lihat connectToHostByKey
+                        // di atas). Sekarang privateKey/passphrase udah di-parse
+                        // dan divalidasi non-null SEBELUM thread ini jalan.
+                        byte[] privateKeyBytes = privateKey.getBytes();
+                        byte[] passphraseBytes = (passphrase != null && !passphrase.isEmpty()) ? passphrase.getBytes() : null;
+                        jsch.addIdentity("default", privateKeyBytes, null, passphraseBytes);
                     }
 
                     Session session = jsch.getSession(username, host, port);
