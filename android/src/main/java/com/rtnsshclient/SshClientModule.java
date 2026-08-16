@@ -6,8 +6,6 @@ import com.facebook.react.bridge.Callback;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReadableMap;
-import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.bridge.Arguments;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.Session;
 import com.jcraft.jsch.Channel;
@@ -40,6 +38,14 @@ public class SshClientModule extends NativeRTNSshClientSpec {
 
     private final ReactApplicationContext reactContext;
     private static final String LOGTAG = "RNSSHClient";
+
+    // BUG FIX (shell output tidak pernah nyampe ke JS): lihat komentar
+    // panjang di readAvailableOutput() di bawah buat penjelasan lengkap.
+    // Angka-angka ini nentuin seberapa lama writeToShell()/startShell()
+    // "nunggu" output sebelum nyerah dan balikin apa yang udah kekumpul.
+    private static final long SHELL_READ_TIMEOUT_MS = 2500; // batas atas nunggu total per panggilan
+    private static final long IDLE_GAP_MS = 150; // abis dapet data, tunggu segini - siapa tau masih ada potongan lain nyusul
+    private static final long POLL_INTERVAL_MS = 30; // jeda antar cek waktu BELUM dapet data sama sekali
 
     Map<String, SSHClient> clientPool = new HashMap<>();
 
@@ -197,15 +203,21 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     client._bufferedReader = new BufferedReader(new InputStreamReader(in));
                     client._dataOutputStream = new DataOutputStream(channel.getOutputStream());
 
-                    callback.invoke();
-
-                    String line;
-                    while (client._bufferedReader != null && (line = client._bufferedReader.readLine()) != null) {
-                        WritableMap map = Arguments.createMap();
-                        map.putString("name", "Shell");
-                        map.putString("key", key);
-                        map.putString("value", line + '\n');
-                    }
+                    // BUG FIX: versi sebelumnya di sini ada loop `while
+                    // (bufferedReader.readLine() != null)` yang jalan di
+                    // background thread INI SELAMANYA (readLine() blocking
+                    // sampai baris baru dateng), tapi tiap baris yang kebaca
+                    // cuma dibungkus jadi WritableMap yang LANGSUNG DIBUANG -
+                    // gak pernah di-emit ke JS lewat event emitter APAPUN
+                    // (gak ada listener/spec buat itu di NativeRTNSshClient.ts).
+                    // Efeknya: output shell KETELAN TOTAL, gak pernah nyampe
+                    // ke JS lewat jalur manapun. Loop itu dihapus - MOTD/banner
+                    // awal (kalau ada) sekarang ditangkep di sini lewat
+                    // readAvailableOutput() dan dibalikin lewat callback,
+                    // konsisten sama pola writeToShell() di bawah (balikin
+                    // output lewat RETURN VALUE promise, bukan event).
+                    String banner = readAvailableOutput(client._bufferedReader);
+                    callback.invoke(null, banner);
 
                 } catch (JSchException error) {
                     Log.e(LOGTAG, "Error starting shell: " + error.getMessage());
@@ -232,7 +244,16 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     }
                     client._dataOutputStream.writeBytes(str);
                     client._dataOutputStream.flush();
-                    callback.invoke();
+
+                    // BUG FIX: versi sebelumnya `callback.invoke()` TANPA
+                    // argumen apapun di sini - artinya response ke JS SELALU
+                    // undefined, apapun yang server balikin. `ssh-terminal.tsx`
+                    // (app) nampilin nilai ini APA ADANYA sebagai output
+                    // command, jadi user gak pernah lihat hasil command
+                    // manapun. Sekarang di-drain beneran lewat
+                    // readAvailableOutput() sebelum callback dipanggil.
+                    String response = readAvailableOutput(client._bufferedReader);
+                    callback.invoke(null, response);
                 } catch (IOException error) {
                     Log.e(LOGTAG, "Error writing to shell:" + error.getMessage());
                     callback.invoke(error.getMessage());
@@ -242,6 +263,66 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                 }
             }
         }).start();
+    }
+
+    /**
+     * Baca SEMUA output yang lagi tersedia dari shell PTY, TANPA nge-block
+     * selamanya kayak `readLine()` (yang nunggu sampai ada karakter newline -
+     * prompt shell interaktif SERING gak diakhiri newline, misal `root@vps:~# `
+     * nunggu input tanpa `\n` di ujungnya, jadi `readLine()` bakal nyangkut
+     * nunggu newline yang gak akan pernah dateng).
+     *
+     * Strategi: poll `BufferedReader.ready()` (cek non-blocking "ada data
+     * gak") dan baca karakter-per-karakter selama ada. Begitu berhenti dapet
+     * data, tunggu jeda pendek (`IDLE_GAP_MS`) siapa tau masih ada potongan
+     * TCP lain yang segera nyusul (output SSH kadang kepecah beberapa paket) -
+     * kalau abis nunggu masih tetep kosong, dianggap output buat command ini
+     * udah selesai ngalir semua. `SHELL_READ_TIMEOUT_MS` jadi batas atas keras
+     * biar gak nyangkut selamanya kalau server nggak pernah balikin apa-apa
+     * sama sekali (mis. command yang emang gak nge-print apapun).
+     *
+     * TRADE-OFF yang disadari: ini heuristik berbasis jeda diam, BUKAN
+     * deteksi "command udah selesai" yang presisi (gak ada cara generik buat
+     * tau itu dari sisi client PTY biasa tanpa parsing prompt/marker khusus).
+     * Command yang lama jalan pun output-nya tetap bakal keliatan (curl
+     * lambat dll bakal numpuk sampai timeout), tapi command yang BENERAN
+     * nyampe >2.5 detik tanpa ngeprint apa-apa dulu bakal keliatan "output
+     * kepotong" - cukup buat pemakaian terminal biasa (cek status, baca log,
+     * jalanin script pendek), bukan buat proses long-running interaktif.
+     */
+    private String readAvailableOutput(BufferedReader reader) throws IOException {
+        StringBuilder result = new StringBuilder();
+        long deadline = System.currentTimeMillis() + SHELL_READ_TIMEOUT_MS;
+        boolean gotAnything = false;
+
+        while (System.currentTimeMillis() < deadline) {
+            if (reader.ready()) {
+                int ch = reader.read();
+                if (ch == -1) break; // stream ditutup dari sisi server
+                result.append((char) ch);
+                gotAnything = true;
+                continue;
+            }
+
+            if (gotAnything) {
+                try {
+                    Thread.sleep(IDLE_GAP_MS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (!reader.ready()) break; // masih diam setelah jeda -> anggap selesai
+            } else {
+                try {
+                    Thread.sleep(POLL_INTERVAL_MS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        return result.toString();
     }
 
     @Override
