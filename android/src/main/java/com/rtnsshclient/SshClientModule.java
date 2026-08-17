@@ -16,6 +16,7 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
 import java.util.Map;
@@ -29,7 +30,10 @@ public class SshClientModule extends NativeRTNSshClientSpec {
 
         Session _session;
         String _key;
-        BufferedReader _bufferedReader;
+        // GANTI dari BufferedReader ke InputStream MENTAH (2026-08-17,
+        // debugging lanjutan) - lihat catatan panjang di readAvailableOutput()
+        // di bawah soal kenapa.
+        InputStream _rawInputStream;
         DataOutputStream _dataOutputStream;
         Channel _channel = null;
     }
@@ -44,7 +48,15 @@ public class SshClientModule extends NativeRTNSshClientSpec {
     // Angka-angka ini nentuin seberapa lama writeToShell()/startShell()
     // "nunggu" output sebelum nyerah dan balikin apa yang udah kekumpul.
     private static final long SHELL_READ_TIMEOUT_MS = 2500; // batas atas nunggu total per panggilan
-    private static final long IDLE_GAP_MS = 150; // abis dapet data, tunggu segini - siapa tau masih ada potongan lain nyusul
+    // Dinaikin dari 150 ke 400 (saran dari konsep PDF Zen, poin 1) - biaya
+    // murah, aman dikombinasi sama fix raw-byte-stream di atas (walau
+    // penyebab UTAMA "value kosong total" kemungkinan besar bukan ini -
+    // lihat penjelasan panjang, `ready()`/`available()` yang gak pernah
+    // true SATU KALI PUN selama 2.5 detik itu gejala beda kelas dari
+    // "kepotong di tengah jeda echo-vs-hasil"). Tetep dinaikin sebagai
+    // margin keamanan buat command yang outputnya kepecah beberapa paket
+    // TCP dengan jeda antar-paket lebih dari 150ms.
+    private static final long IDLE_GAP_MS = 400;
     private static final long POLL_INTERVAL_MS = 30; // jeda antar cek waktu BELUM dapet data sama sekali
 
     Map<String, SSHClient> clientPool = new HashMap<>();
@@ -207,12 +219,25 @@ public class SshClientModule extends NativeRTNSshClientSpec {
 
                     Channel channel = session.openChannel("shell");
                     ((ChannelShell) channel).setPtyType(ptyType);
+                    // EKSPERIMEN #2 (laporan Zen: banner & writeToShell
+                    // dua-duanya konsisten balikin string KOSONG, bukan
+                    // error - artinya `readAvailableOutput()` gak pernah
+                    // nangkep data APAPUN dari server). Versi sebelumnya
+                    // manggil `channel.connect()` DULU, baru ambil
+                    // input/output stream sesudahnya - kebalik dari contoh
+                    // resmi JSch (`getInputStream()`/`getOutputStream()`
+                    // SEBELUM `connect()`). Sekarang dibalik urutannya, plus
+                    // `setPtySize` eksplisit (beberapa server nolak/nahan
+                    // kirim output ke PTY yang ukurannya gak pernah
+                    // dinegosiasikan sama sekali).
+                    ((ChannelShell) channel).setPtySize(80, 24, 640, 480);
+                    InputStream in = channel.getInputStream();
+                    OutputStream out = channel.getOutputStream();
                     channel.connect();
 
-                    InputStream in = channel.getInputStream();
                     client._channel = channel;
-                    client._bufferedReader = new BufferedReader(new InputStreamReader(in));
-                    client._dataOutputStream = new DataOutputStream(channel.getOutputStream());
+                    client._rawInputStream = in;
+                    client._dataOutputStream = new DataOutputStream(out);
 
                     // BUG FIX: versi sebelumnya di sini ada loop `while
                     // (bufferedReader.readLine() != null)` yang jalan di
@@ -227,7 +252,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     // readAvailableOutput() dan dibalikin lewat callback,
                     // konsisten sama pola writeToShell() di bawah (balikin
                     // output lewat RETURN VALUE promise, bukan event).
-                    String banner = readAvailableOutput(client._bufferedReader);
+                    String banner = readAvailableOutput(client._rawInputStream);
                     // Sama kayak catatan EKSPERIMEN di execute() di atas.
                     callback.invoke("", banner);
 
@@ -257,6 +282,17 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     client._dataOutputStream.writeBytes(str);
                     client._dataOutputStream.flush();
 
+                    // Jeda kecil (saran konsep PDF Zen, poin 2) - kasih waktu
+                    // paket TCP pertama (echo dari server) beneran nyampe &
+                    // "numpuk" dulu sebelum readAvailableOutput() mulai
+                    // ngecek `available()` - ngurangin kemungkinan poll
+                    // pertama kejadian PAS SEBELUM byte pertama nyampe.
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+
                     // BUG FIX: versi sebelumnya `callback.invoke()` TANPA
                     // argumen apapun di sini - artinya response ke JS SELALU
                     // undefined, apapun yang server balikin. `ssh-terminal.tsx`
@@ -264,7 +300,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     // command, jadi user gak pernah lihat hasil command
                     // manapun. Sekarang di-drain beneran lewat
                     // readAvailableOutput() sebelum callback dipanggil.
-                    String response = readAvailableOutput(client._bufferedReader);
+                    String response = readAvailableOutput(client._rawInputStream);
                     callback.invoke("", response);
                 } catch (IOException error) {
                     Log.e(LOGTAG, "Error writing to shell:" + error.getMessage());
@@ -284,35 +320,54 @@ public class SshClientModule extends NativeRTNSshClientSpec {
      * nunggu input tanpa `\n` di ujungnya, jadi `readLine()` bakal nyangkut
      * nunggu newline yang gak akan pernah dateng).
      *
-     * Strategi: poll `BufferedReader.ready()` (cek non-blocking "ada data
-     * gak") dan baca karakter-per-karakter selama ada. Begitu berhenti dapet
-     * data, tunggu jeda pendek (`IDLE_GAP_MS`) siapa tau masih ada potongan
-     * TCP lain yang segera nyusul (output SSH kadang kepecah beberapa paket) -
-     * kalau abis nunggu masih tetep kosong, dianggap output buat command ini
-     * udah selesai ngalir semua. `SHELL_READ_TIMEOUT_MS` jadi batas atas keras
-     * biar gak nyangkut selamanya kalau server nggak pernah balikin apa-apa
-     * sama sekali (mis. command yang emang gak nge-print apapun).
+     * REVISI 2026-08-17 (debugging lanjutan bareng Zen): versi PERTAMA fungsi
+     * ini pakai `BufferedReader.ready()` + `read()` char-per-char - TERBUKTI
+     * SELALU balikin string kosong di device asli (dikonfirmasi lewat
+     * instrumentasi debug di JS: `typeof=string value="" length=0`, padahal
+     * SSH biasa ke server yang SAMA jalan normal - jadi bukan masalah
+     * server/koneksi). Dicurigai `Reader.ready()` (yang internalnya nge-cek
+     * `available() > 0` TAPI lewat lapisan decoding character InputStreamReader)
+     * gak seakurat manggil `available()` LANGSUNG ke InputStream mentah dari
+     * channel JSch - kemungkinan ada buffering/timing di lapisan decoding
+     * char itu yang bikin `ready()` gak pernah nganggep ada data padahal
+     * byte udah nyampe di level stream. Sekarang ditulis ulang kerja di level
+     * BYTE MENTAH (`InputStream.available()` + `read(byte[])`), decode ke
+     * String cuma SEKALI di akhir - ngilangin lapisan Reader/decoding yang
+     * dicurigai jadi sumber masalah.
+     *
+     * Strategi baca tetap sama (polling + idle-gap heuristik), cuma level
+     * operasinya beda: `in.available()` (cek non-blocking langsung ke
+     * stream, bukan lewat Reader) buat tau ada byte nunggu apa nggak, baca
+     * pakai `read(byte[])` (bisa berapa byte sekaligus dalam satu panggilan,
+     * bukan satu-satu). Begitu berhenti dapet data, tunggu jeda pendek
+     * (`IDLE_GAP_MS`) siapa tau masih ada potongan TCP lain yang segera
+     * nyusul - kalau abis nunggu masih tetep kosong, dianggap output buat
+     * command ini udah selesai ngalir semua. `SHELL_READ_TIMEOUT_MS` jadi
+     * batas atas keras biar gak nyangkut selamanya kalau server nggak
+     * pernah balikin apa-apa sama sekali.
      *
      * TRADE-OFF yang disadari: ini heuristik berbasis jeda diam, BUKAN
-     * deteksi "command udah selesai" yang presisi (gak ada cara generik buat
-     * tau itu dari sisi client PTY biasa tanpa parsing prompt/marker khusus).
-     * Command yang lama jalan pun output-nya tetap bakal keliatan (curl
-     * lambat dll bakal numpuk sampai timeout), tapi command yang BENERAN
-     * nyampe >2.5 detik tanpa ngeprint apa-apa dulu bakal keliatan "output
-     * kepotong" - cukup buat pemakaian terminal biasa (cek status, baca log,
-     * jalanin script pendek), bukan buat proses long-running interaktif.
+     * deteksi "command udah selesai" yang presisi. Command yang lama jalan
+     * pun output-nya tetap bakal keliatan (curl lambat dll bakal numpuk
+     * sampai timeout), tapi command yang BENERAN nyampe >2.5 detik tanpa
+     * ngeprint apa-apa dulu bakal keliatan "output kepotong" - cukup buat
+     * pemakaian terminal biasa, bukan buat proses long-running interaktif.
      */
-    private String readAvailableOutput(BufferedReader reader) throws IOException {
-        StringBuilder result = new StringBuilder();
+    private String readAvailableOutput(InputStream in) throws IOException {
+        java.io.ByteArrayOutputStream result = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
         long deadline = System.currentTimeMillis() + SHELL_READ_TIMEOUT_MS;
         boolean gotAnything = false;
 
         while (System.currentTimeMillis() < deadline) {
-            if (reader.ready()) {
-                int ch = reader.read();
-                if (ch == -1) break; // stream ditutup dari sisi server
-                result.append((char) ch);
-                gotAnything = true;
+            int available = in.available();
+            if (available > 0) {
+                int n = in.read(buf, 0, Math.min(available, buf.length));
+                if (n == -1) break; // stream ditutup dari sisi server
+                if (n > 0) {
+                    result.write(buf, 0, n);
+                    gotAnything = true;
+                }
                 continue;
             }
 
@@ -323,7 +378,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     Thread.currentThread().interrupt();
                     break;
                 }
-                if (!reader.ready()) break; // masih diam setelah jeda -> anggap selesai
+                if (in.available() <= 0) break; // masih diam setelah jeda -> anggap selesai
             } else {
                 try {
                     Thread.sleep(POLL_INTERVAL_MS);
@@ -334,7 +389,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
             }
         }
 
-        return result.toString();
+        return result.toString("UTF-8");
     }
 
     @Override
@@ -355,8 +410,8 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                         client._dataOutputStream.close();
                     }
 
-                    if (client._bufferedReader != null) {
-                        client._bufferedReader.close();
+                    if (client._rawInputStream != null) {
+                        client._rawInputStream.close();
                     }
                 } catch (IOException error) {
                     Log.e(LOGTAG, "Error closing shell:" + error.getMessage());
