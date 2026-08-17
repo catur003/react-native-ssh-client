@@ -32,10 +32,13 @@ public class SshClientModule extends NativeRTNSshClientSpec {
         String _key;
         // GANTI dari BufferedReader ke InputStream MENTAH (2026-08-17,
         // debugging lanjutan) - lihat catatan panjang di readAvailableOutput()
-        // di bawah soal kenapa.
-        InputStream _rawInputStream;
-        DataOutputStream _dataOutputStream;
-        Channel _channel = null;
+        // di bawah soal kenapa. `volatile` ditambah di 3 field ini (jaga-jaga,
+        // gak ada downside) - startShell()/writeToShell() jalan di THREAD
+        // TERPISAH tiap dipanggil, field yang di-share antar thread tanpa
+        // `volatile`/synchronization gak ada jaminan keliatan up-to-date.
+        volatile InputStream _rawInputStream;
+        volatile DataOutputStream _dataOutputStream;
+        volatile Channel _channel = null;
     }
 
     public static String NAME = "RTNSshClient";
@@ -279,28 +282,52 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     if (client == null) {
                         throw new Exception("client is null");
                     }
-                    client._dataOutputStream.writeBytes(str);
-                    client._dataOutputStream.flush();
+                    // DEBUG SEMENTARA: pastiin objek client & channel yang
+                    // ditemu writeToShell() SAMA persis kayak yang dipakai
+                    // startShell() (banner udah kebukti kerja) - kalau
+                    // ternyata beda instance/channel udah closed, itu jelas
+                    // akar masalahnya, bukan soal timing lagi.
+                    boolean channelConnected = client._channel != null && client._channel.isConnected();
+                    boolean channelClosed = client._channel != null && client._channel.isClosed();
 
-                    // Jeda kecil (saran konsep PDF Zen, poin 2) - kasih waktu
-                    // paket TCP pertama (echo dari server) beneran nyampe &
-                    // "numpuk" dulu sebelum readAvailableOutput() mulai
-                    // ngecek `available()` - ngurangin kemungkinan poll
-                    // pertama kejadian PAS SEBELUM byte pertama nyampe.
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
+                    String response = writeAndRead(client, str);
+
+                    // KEMUNGKINAN #2 (banyak PTY expect carriage-return "\r"
+                    // buat Enter, bukan newline "\n" - beda dari mode kanonik
+                    // biasa): kalau percobaan pertama kosong total, coba SEKALI
+                    // LAGI kirim "\r" polos (tanpa nulis ulang command-nya -
+                    // command yang tadi mungkin udah "nyangkut" di buffer
+                    // baris server, cuma butuh terminator yang bener buat
+                    // dieksekusi).
+                    boolean retriedWithCR = false;
+                    if (response.isEmpty()) {
+                        retriedWithCR = true;
+                        response = writeAndRead(client, "\r");
                     }
 
-                    // BUG FIX: versi sebelumnya `callback.invoke()` TANPA
-                    // argumen apapun di sini - artinya response ke JS SELALU
-                    // undefined, apapun yang server balikin. `ssh-terminal.tsx`
-                    // (app) nampilin nilai ini APA ADANYA sebagai output
-                    // command, jadi user gak pernah lihat hasil command
-                    // manapun. Sekarang di-drain beneran lewat
-                    // readAvailableOutput() sebelum callback dipanggil.
-                    String response = readAvailableOutput(client._rawInputStream);
+                    // DEBUG SEMENTARA: kalau MASIH kosong juga abis retry,
+                    // tempelin snapshot `available()` di BEBERAPA titik waktu
+                    // (bukan cuma sekali di 100ms) - biar keliatan jelas ADA
+                    // data yang numpuk telat (bukti butuh nunggu lebih lama)
+                    // atau BENERAN gak ada apa-apa sama sekali sepanjang waktu
+                    // (bukti soal write, bukan soal timing).
+                    if (response.isEmpty()) {
+                        int[] checkpointsMs = { 0, 100, 300, 600, 1000, 1500 };
+                        StringBuilder trace = new StringBuilder();
+                        for (int ms : checkpointsMs) {
+                            try {
+                                Thread.sleep(ms == 0 ? 0 : 100);
+                            } catch (InterruptedException ignored) {
+                                Thread.currentThread().interrupt();
+                            }
+                            trace.append(ms).append("ms=").append(client._rawInputStream.available()).append(' ');
+                        }
+                        response = String.format(
+                            "[NATIVE DEBUG] wroteBytes=%d channelConnected=%b channelClosed=%b retriedWithCR=%b trace(cumulative~%dms)=[%s]",
+                            str.length(), channelConnected, channelClosed, retriedWithCR, 2100, trace.toString().trim()
+                        );
+                    }
+
                     callback.invoke("", response);
                 } catch (IOException error) {
                     Log.e(LOGTAG, "Error writing to shell:" + error.getMessage());
@@ -353,6 +380,33 @@ public class SshClientModule extends NativeRTNSshClientSpec {
      * ngeprint apa-apa dulu bakal keliatan "output kepotong" - cukup buat
      * pemakaian terminal biasa, bukan buat proses long-running interaktif.
      */
+    /**
+     * Tulis `payload` ke shell + baca balik hasilnya - dipakai `writeToShell()`
+     * buat percobaan PERTAMA (command asli) dan RETRY (kirim "\r" doang kalau
+     * percobaan pertama kosong). Tulis pakai byte array eksplisit
+     * (`getBytes("UTF-8")` + `write(byte[])`), BUKAN `writeBytes(String)` -
+     * `writeBytes` DataOutputStream cuma nulis byte RENDAH tiap char (buang
+     * bit atas), identik hasilnya buat ASCII polos tapi salah buat karakter
+     * non-ASCII apapun (jarang kejadian buat command shell, tapi gak ada
+     * alasan pakai method yang secara teknis kurang benar kalau alternatifnya
+     * sama gampangnya).
+     */
+    private String writeAndRead(SSHClient client, String payload) throws IOException {
+        client._dataOutputStream.write(payload.getBytes("UTF-8"));
+        client._dataOutputStream.flush();
+
+        // Jeda kecil (saran konsep PDF Zen, poin 2) - kasih waktu paket TCP
+        // pertama (echo dari server) beneran nyampe & "numpuk" dulu sebelum
+        // readAvailableOutput() mulai ngecek `available()`.
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+
+        return readAvailableOutput(client._rawInputStream);
+    }
+
     private String readAvailableOutput(InputStream in) throws IOException {
         java.io.ByteArrayOutputStream result = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[4096];
