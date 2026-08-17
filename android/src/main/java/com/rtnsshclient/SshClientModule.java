@@ -171,7 +171,18 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                         response += line + "\r\n";
                     }
 
-                    callback.invoke(null, response);
+                    // EKSPERIMEN (belum kebukti fix, laporan "whoami no output" gak
+                    // terpecahin dari analisa statis): ganti `null` jadi `""` (empty
+                    // string) buat argumen error - spec TurboModule (NativeRTNSshClient.ts)
+                    // declare parameter ini non-nullable `string`, bukan `string | null`.
+                    // Codegen New Architecture kadang lebih ketat soal ini dibanding
+                    // bridge lama, dan pola callback 2-argumen ini (error + response)
+                    // gak pernah punya referensi lain yang kebukti jalan di app ini
+                    // (execute() - satu-satunya method lain yang sama polanya - gak
+                    // pernah dipanggil dari mana pun). JS-side aman (`if (error)`
+                    // tetap falsy buat "" sama kayak null), jadi perubahan ini
+                    // gak beresiko break yang lain, cuma belum pasti ini akar masalahnya.
+                    callback.invoke("", response);
                 } catch (JSchException error) {
                     Log.e(LOGTAG, "Error executing command: " + error.getMessage());
                     callback.invoke(error.getMessage());
@@ -217,7 +228,8 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     // konsisten sama pola writeToShell() di bawah (balikin
                     // output lewat RETURN VALUE promise, bukan event).
                     String banner = readAvailableOutput(client._bufferedReader);
-                    callback.invoke(null, banner);
+                    // Sama kayak catatan EKSPERIMEN di execute() di atas.
+                    callback.invoke("", banner);
 
                 } catch (JSchException error) {
                     Log.e(LOGTAG, "Error starting shell: " + error.getMessage());
@@ -253,7 +265,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     // manapun. Sekarang di-drain beneran lewat
                     // readAvailableOutput() sebelum callback dipanggil.
                     String response = readAvailableOutput(client._bufferedReader);
-                    callback.invoke(null, response);
+                    callback.invoke("", response);
                 } catch (IOException error) {
                     Log.e(LOGTAG, "Error writing to shell:" + error.getMessage());
                     callback.invoke(error.getMessage());
