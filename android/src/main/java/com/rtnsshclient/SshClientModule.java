@@ -222,21 +222,23 @@ public class SshClientModule extends NativeRTNSshClientSpec {
 
                     Channel channel = session.openChannel("shell");
                     ((ChannelShell) channel).setPtyType(ptyType);
-                    // EKSPERIMEN #2 (laporan Zen: banner & writeToShell
-                    // dua-duanya konsisten balikin string KOSONG, bukan
-                    // error - artinya `readAvailableOutput()` gak pernah
-                    // nangkep data APAPUN dari server). Versi sebelumnya
-                    // manggil `channel.connect()` DULU, baru ambil
-                    // input/output stream sesudahnya - kebalik dari contoh
-                    // resmi JSch (`getInputStream()`/`getOutputStream()`
-                    // SEBELUM `connect()`). Sekarang dibalik urutannya, plus
-                    // `setPtySize` eksplisit (beberapa server nolak/nahan
-                    // kirim output ke PTY yang ukurannya gak pernah
-                    // dinegosiasikan sama sekali).
                     ((ChannelShell) channel).setPtySize(80, 24, 640, 480);
+
+                    // EKSPERIMEN #3 (2026-08-17, data konkret dari trace
+                    // multi-checkpoint: writeToShell KONSISTEN 0 byte
+                    // available() di SEMUA titik waktu selama 2.1 detik,
+                    // channel connected=true, write gak error - TAPI banner
+                    // di startShell berhasil penuh pakai stream yang SAMA.
+                    // Asimetri ini nunjuk ke urutan ambil stream: INPUT
+                    // sebelum connect() TERBUKTI jalan (banner buktinya),
+                    // tapi OUTPUT sebelum connect() dicurigai JUSTRU rusak -
+                    // beberapa implementasi JSch beda perlakuan antara dua
+                    // stream ini soal kapan mereka "hidup". Sekarang
+                    // dipisah: input tetap SEBELUM connect(), output
+                    // dipindah ke SESUDAH connect().
                     InputStream in = channel.getInputStream();
-                    OutputStream out = channel.getOutputStream();
                     channel.connect();
+                    OutputStream out = channel.getOutputStream();
 
                     client._channel = channel;
                     client._rawInputStream = in;
