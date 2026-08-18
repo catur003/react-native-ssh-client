@@ -38,6 +38,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
         // `volatile`/synchronization gak ada jaminan keliatan up-to-date.
         volatile InputStream _rawInputStream;
         volatile DataOutputStream _dataOutputStream;
+        volatile OutputStream _rawOutputStream; // dipakai STRATEGY 1-3, skip DataOutputStream sama sekali
         volatile Channel _channel = null;
     }
 
@@ -51,6 +52,21 @@ public class SshClientModule extends NativeRTNSshClientSpec {
     // Angka-angka ini nentuin seberapa lama writeToShell()/startShell()
     // "nunggu" output sebelum nyerah dan balikin apa yang udah kekumpul.
     private static final long SHELL_READ_TIMEOUT_MS = 2500; // batas atas nunggu total per panggilan
+    // TOGGLE EKSPERIMEN (2026-08-19) - channel KETAHUAN masih sehat PERSIS
+    // sesudah write()+flush(), tapi ~100ms kemudian (thread BACKGROUND JSch
+    // sendiri, bukan thread kita) udah EOF - bereaksi ke SESUATU dari
+    // write() kita, bukan pas write-nya sendiri. Ganti angka konstanta di
+    // bawah buat coba pendekatan beda TANPA perlu file baru tiap kali -
+    // build ulang di Android Studio (cepet sekarang), tes, kalau masih
+    // gagal ganti angkanya lagi, build lagi.
+    //
+    // STRATEGY 0 = kondisi SEKARANG (DataOutputStream.write() biasa) - buat baseline/pembanding.
+    // STRATEGY 1 = tulis LANGSUNG ke OutputStream mentah (skip DataOutputStream sama sekali).
+    // STRATEGY 2 = strategy 1 + eksplisit setPty(true) (jaga-jaga default PTY kebeda di fork ini).
+    // STRATEGY 3 = strategy 2 + kirim per-KARAKTER (bukan whole-array sekali nembak) - beberapa server/PTY
+    //              pengen input dikirim char-by-char kayak keyboard beneran, bukan blok sekaligus.
+    //gagal semua
+    private static final int WRITE_STRATEGY = 3;
     // Dinaikin dari 150 ke 400 (saran dari konsep PDF Zen, poin 1) - biaya
     // murah, aman dikombinasi sama fix raw-byte-stream di atas (walau
     // penyebab UTAMA "value kosong total" kemungkinan besar bukan ini -
@@ -223,25 +239,34 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     Channel channel = session.openChannel("shell");
                     ((ChannelShell) channel).setPtyType(ptyType);
                     ((ChannelShell) channel).setPtySize(80, 24, 640, 480);
+                    if (WRITE_STRATEGY >= 2) {
+                        // STRATEGY 2+: eksplisit minta PTY - jaga-jaga default
+                        // channel.setPty() di fork/versi JSch ini beda dari
+                        // yang diasumsikan (biasanya default true buat
+                        // ChannelSession, tapi belum pernah dicek eksplisit).
+                        ((ChannelShell) channel).setPty(true);
+                    }
 
-                    // EKSPERIMEN #3 (2026-08-17, data konkret dari trace
-                    // multi-checkpoint: writeToShell KONSISTEN 0 byte
-                    // available() di SEMUA titik waktu selama 2.1 detik,
-                    // channel connected=true, write gak error - TAPI banner
-                    // di startShell berhasil penuh pakai stream yang SAMA.
-                    // Asimetri ini nunjuk ke urutan ambil stream: INPUT
-                    // sebelum connect() TERBUKTI jalan (banner buktinya),
-                    // tapi OUTPUT sebelum connect() dicurigai JUSTRU rusak -
-                    // beberapa implementasi JSch beda perlakuan antara dua
-                    // stream ini soal kapan mereka "hidup". Sekarang
-                    // dipisah: input tetap SEBELUM connect(), output
-                    // dipindah ke SESUDAH connect().
+                    // EKSPERIMEN #4 (2026-08-19, dikonfirmasi lewat Logcat
+                    // beneran, bukan nebak lagi): trace nunjukin banner
+                    // (input stream, diambil SEBELUM connect() - Eksperimen
+                    // #3) SELALU berhasil dapet data, TAPI writeToShell
+                    // (nulis ke output stream yang di Eksperimen #3 dipindah
+                    // ke SESUDAH connect()) SELALU 0 byte balik, tanpa
+                    // kecuali, walau write()/flush() gak pernah nge-throw
+                    // exception ("sukses" tapi kemungkinan besar nulis ke
+                    // stream yang gak nyambung ke channel asli). Eksperimen
+                    // #3 misahin input(sebelum)/output(sesudah) itu DUGAAN
+                    // yang belum pernah dites sendiri-sendiri - sekarang
+                    // dibalikin, DUA-DUANYA diambil SEBELUM connect() (sama
+                    // kayak Eksperimen #2 awal, sebelum sempat dipisah).
                     InputStream in = channel.getInputStream();
-                    channel.connect();
                     OutputStream out = channel.getOutputStream();
+                    channel.connect();
 
                     client._channel = channel;
                     client._rawInputStream = in;
+                    client._rawOutputStream = out;
                     client._dataOutputStream = new DataOutputStream(out);
 
                     // BUG FIX: versi sebelumnya di sini ada loop `while
@@ -257,7 +282,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                     // readAvailableOutput() dan dibalikin lewat callback,
                     // konsisten sama pola writeToShell() di bawah (balikin
                     // output lewat RETURN VALUE promise, bukan event).
-                    String banner = readAvailableOutput(client._rawInputStream);
+                    String banner = readAvailableOutput(client._rawInputStream, client._channel);
                     // Sama kayak catatan EKSPERIMEN di execute() di atas.
                     callback.invoke("", banner);
 
@@ -325,8 +350,8 @@ public class SshClientModule extends NativeRTNSshClientSpec {
                             trace.append(ms).append("ms=").append(client._rawInputStream.available()).append(' ');
                         }
                         response = String.format(
-                            "[NATIVE DEBUG] wroteBytes=%d channelConnected=%b channelClosed=%b retriedWithCR=%b trace(cumulative~%dms)=[%s]",
-                            str.length(), channelConnected, channelClosed, retriedWithCR, 2100, trace.toString().trim()
+                                "[NATIVE DEBUG] wroteBytes=%d channelConnected=%b channelClosed=%b retriedWithCR=%b trace(cumulative~%dms)=[%s]",
+                                str.length(), channelConnected, channelClosed, retriedWithCR, 2100, trace.toString().trim()
                         );
                     }
 
@@ -394,8 +419,29 @@ public class SshClientModule extends NativeRTNSshClientSpec {
      * sama gampangnya).
      */
     private String writeAndRead(SSHClient client, String payload) throws IOException {
-        client._dataOutputStream.write(payload.getBytes("UTF-8"));
-        client._dataOutputStream.flush();
+        Log.d(LOGTAG, "writeAndRead[strategy=" + WRITE_STRATEGY + "]: mulai, payload=[" + payload.replace("\n", "\\n").replace("\r", "\\r") + "] channelConnected=" + (client._channel != null && client._channel.isConnected()));
+
+        byte[] bytes = payload.getBytes("UTF-8");
+        if (WRITE_STRATEGY == 0) {
+            client._dataOutputStream.write(bytes);
+            client._dataOutputStream.flush();
+        } else if (WRITE_STRATEGY == 3) {
+            // STRATEGY 3: kirim per-KARAKTER (bukan whole-array sekali
+            // nembak) + flush TIAP karakter - niru keyboard beneran, buat
+            // jaga-jaga server/PTY tertentu perlakukan "satu paket besar"
+            // beda dari "banyak paket kecil beruntun".
+            for (byte b : bytes) {
+                client._rawOutputStream.write(b);
+                client._rawOutputStream.flush();
+            }
+        } else {
+            // STRATEGY 1 & 2: skip DataOutputStream sama sekali, tulis
+            // LANGSUNG ke OutputStream mentah dari channel.
+            client._rawOutputStream.write(bytes);
+            client._rawOutputStream.flush();
+        }
+
+        Log.d(LOGTAG, "writeAndRead: write+flush selesai, " + bytes.length + " byte terkirim, LANGSUNG SESUDAH write isConnected=" + client._channel.isConnected() + " isEOF=" + client._channel.isEOF());
 
         // Jeda kecil (saran konsep PDF Zen, poin 2) - kasih waktu paket TCP
         // pertama (echo dari server) beneran nyampe & "numpuk" dulu sebelum
@@ -406,19 +452,45 @@ public class SshClientModule extends NativeRTNSshClientSpec {
             Thread.currentThread().interrupt();
         }
 
-        return readAvailableOutput(client._rawInputStream);
+        Log.d(LOGTAG, "writeAndRead: mulai readAvailableOutput, rawInputStream=" + (client._rawInputStream != null));
+        String result = readAvailableOutput(client._rawInputStream, client._channel);
+        Log.d(LOGTAG, "writeAndRead: hasil akhir length=" + result.length() + " isi=[" + result.replace("\n", "\\n").replace("\r", "\\r") + "]");
+        return result;
     }
 
-    private String readAvailableOutput(InputStream in) throws IOException {
+    private String readAvailableOutput(InputStream in, Channel channel) throws IOException {
         java.io.ByteArrayOutputStream result = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[4096];
         long deadline = System.currentTimeMillis() + SHELL_READ_TIMEOUT_MS;
         boolean gotAnything = false;
+        int loopCount = 0;
+        boolean loggedDisconnect = false;
+
+        Log.d(LOGTAG, "readAvailableOutput: mulai polling, in.available() awal=" + in.available() + " isConnected=" + channel.isConnected() + " isEOF=" + channel.isEOF());
 
         while (System.currentTimeMillis() < deadline) {
+            loopCount++;
+
+            // BARU: cek isConnected()/isEOF() TIAP iterasi (bukan cuma di
+            // awal/akhir) - begitu KETAHUAN berubah jadi disconnect/EOF,
+            // di-log SEKALI (loggedDisconnect flag, biar gak banjir log
+            // ratusan baris sama abis kejadian sekali).
+            if (!loggedDisconnect && (!channel.isConnected() || channel.isEOF())) {
+                Log.d(LOGTAG, "readAvailableOutput: channel BERUBAH jadi disconnect/EOF di loop#" + loopCount + " (elapsed=" + (SHELL_READ_TIMEOUT_MS - (deadline - System.currentTimeMillis())) + "ms) isConnected=" + channel.isConnected() + " isEOF=" + channel.isEOF() + " exitStatus=" + channel.getExitStatus());
+                loggedDisconnect = true;
+            }
+
             int available = in.available();
+            if (loopCount <= 5 || loopCount % 20 == 0) {
+                // Log SEMUA iterasi awal (5 pertama) + tiap 20 iterasi
+                // sesudahnya - biar gak banjir log ribuan baris identik
+                // (POLL_INTERVAL_MS 30ms x 2500ms timeout = ratusan iterasi),
+                // tapi tetep keliatan progresnya kalau lama.
+                Log.d(LOGTAG, "readAvailableOutput: loop#" + loopCount + " available()=" + available + " gotAnything=" + gotAnything);
+            }
             if (available > 0) {
                 int n = in.read(buf, 0, Math.min(available, buf.length));
+                Log.d(LOGTAG, "readAvailableOutput: baca " + n + " byte");
                 if (n == -1) break; // stream ditutup dari sisi server
                 if (n > 0) {
                     result.write(buf, 0, n);
@@ -445,6 +517,7 @@ public class SshClientModule extends NativeRTNSshClientSpec {
             }
         }
 
+        Log.d(LOGTAG, "readAvailableOutput: SELESAI, total loop=" + loopCount + " gotAnything=" + gotAnything + " totalBytes=" + result.size() + " isConnected_akhir=" + channel.isConnected());
         return result.toString("UTF-8");
     }
 
